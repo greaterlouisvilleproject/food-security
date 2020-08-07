@@ -1,0 +1,111 @@
+---
+title: "create_data"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(glptools)
+glp_load_packages()
+
+library(survey)
+```
+
+Vehicle Access
+
+Current output is vehicle access at the county and tract level
+Data on means of transportation to work are available by race, but not vehice access. Could use microdata to disaggregate. 
+```{r cars}
+vehicle_vars_1yr <- build_census_var_df("acs1", "B08201", 
+                                        additional_filters = "^Estimate!!Total(!!No vehicle available)?$")
+vehicle_vars_5yr <- build_census_var_df("acs5", "B08201", 
+                                        additional_filters = "^Estimate!!Total(!!No vehicle available)?$")
+
+vehicle_county <- get_census(vehicle_vars_1yr, geog = "FIPS")
+vehicle_map    <- get_census(vehicle_vars_5yr, geog = "tract")
+
+vehicle_access_county <- vehicle_county %>%
+  mutate(vehicle = if_else(str_detect(label, "No vehicle available"), F, T)) %>%
+  process_census(cat_var = "vehicle", output_name = "vehicle_access")
+
+vehicle_map %<>% 
+  mutate(vehicle = if_else(str_detect(label, "No vehicle available"), F, T)) %>%
+  process_census(cat_var = "vehicle", output_name = "vehicle_access")
+
+process_map(vehicle_map, vehicle_access, return_name = "vehicle_access", pop = vehicle_access_pop) %>% list2env(.GlobalEnv)
+  
+save(vehicle_access_county, vehicle_access_tract, vehicle_access_nh, vehicle_access_muw, 
+     file = "output_data/vehicle_access.RData")
+```
+
+Food Security
+
+Food security data comes from the December supplement. 
+Because the number of unique housholds included in each December supplement is very small, sampling error is large. I use a "rolling survey" function to pool years of data together for estimates, similar to ACS 3-year or 5-year data.
+```{r}
+cps_micro <- feather::read_feather("../../glpdata/data-raw/microdata/cps_micro.feather")
+
+# Create food security category variable and food security dummy variable.
+cps_micro %<>%
+  mutate(
+    food_security_cat = case_when(
+      FSSTATUS == 1 ~ "food_secure",
+      FSSTATUS == 2 ~ "low_food_secure",
+      FSSTATUS == 3 ~ "very_low_food_secure",
+      TRUE          ~ NA_character_),
+    food_insecure = case_when(
+      FSSTATUS == 1 ~ 0,
+      FSSTATUS %in% 2:3 ~ 1,
+      TRUE ~ NA_real_))
+
+# Filter to December supplement and remove households which appear in the survey twice.
+cps_micro %<>% 
+  filter(MONTH == 12) %>%
+  filter(!duplicated(CPSID))
+
+rolling_svy <- function(df, rm, geog) {
+  
+  # Calculate years for output based on the rolling mean (i.e. 2005:2017 or 2006:2016)
+  years_original <- 2004:2018
+  years <- rollmeanr(years_original, rm)
+  years <- years[!is.na(years)]
+  
+  # FIPS codes from the entire MSA are included in the data.
+  # If using FIPS, remove FIPS codes outside the core counties.
+  if (geog == "FIPS") df %<>% pull_peers(geog = "FIPS")
+  
+  # For y in years, filter to rm years centered around y and run a survey
+  for (y in years) {
+    
+    these_years = (y-floor(rm/2)):(y+floor(rm/2))
+    
+    temp <- df %>%
+      filter(year %in% these_years)
+    
+    svy_obj <- svydesign(ids = ~1, weights = ~HWTFINL, data = temp)
+    
+    svy_df <- svyby(~food_insecure, as.formula(paste0("~", geog)), design = svy_obj, svymean, na.rm = TRUE)
+    
+    svy_df$year <- y
+    
+    output <- assign_row_join(output, svy_df)
+  }
+  
+  output %<>% select(any_of(c("MSA", "FIPS", "year", "food_insecure", "se")))
+}
+
+food_security_1yr <- rolling_svy(cps_micro, 1, "MSA")
+food_security_3yr <- rolling_svy(cps_micro, 3, "MSA")
+food_security_5yr <- rolling_svy(cps_micro, 5, "MSA")
+
+# Evaluate se as a percent out of 100 and as a margin or error around food insecurity
+mean(food_security_1yr$se)
+mean(food_security_3yr$se)
+mean(food_security_5yr$se)
+
+mean(food_security_1yr$se / food_security_1yr$food_insecure * 100, na.rm = T)
+mean(food_security_3yr$se / food_security_3yr$food_insecure * 100, na.rm = T)
+mean(food_security_5yr$se / food_security_5yr$food_insecure * 100, na.rm = T)
+
+save(food_security_1yr, food_security_3yr, food_security_5yr,
+     file = "output_data/food_security.RData")
+```
